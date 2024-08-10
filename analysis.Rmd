@@ -1,0 +1,591 @@
+---
+title: "rnaseq_variation_analysis"
+author: "Hansen Han"
+date: "2024-06-18"
+output: html_document
+---
+
+Integrating samples from several RNAseq studies looking at whole blood to see if they can be integrated.
+
+## Load Packages
+```{r}
+library(tidyverse)
+library(MetaIntegrator)
+library(magrittr)
+library(stringr)
+library(biomaRt)
+library(ggplot2)
+library(stats)
+```
+
+Get conversion table
+```{r}
+# Connect to the Ensembl BioMart database
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Retrieve the HGNC symbols for the given ENST IDs
+hgnc_symbols <- getBM(
+  attributes = c("ensembl_transcript_id", "hgnc_symbol"),
+  mart = ensembl
+)
+hgnc_symbols
+```
+
+# Download Metadata
+
+```{r}
+geo_to_bioproject_map <- c(
+  "GSE242252" = "PRJNA1012708",
+  "GSE237960" = "PRJNA997301",
+  "GSE139940" = "PRJNA587698",
+  "GSE144406" = "PRJNA603562",
+  "GSE234585" = "PRJNA982094",
+  "GSE224849" = "PRJNA932798",
+  "GSE186505" = "PRJNA774204",
+  "GSE161731" = "PRJNA679264",
+  "GSE155454" = "PRJNA649786",
+  "GSE147339" = "PRJNA613909",
+  "GSE123835" = "PRJNA510012",
+  "GSE110487" = "PRJNA433853"
+)
+study_ids = names(geo_to_bioproject_map)
+#as.character(geo_to_bioproject_map["GSE110487"])
+geo_study_data <- getGEOData(gseVector = study_ids, destdir="./")
+
+```
+
+Remove studies with more than one platform
+```{r}
+# for GSE110487 - remove data from the Illumina Genome Analyzer IIx, only keep the samples from the Illumina HiSeq 2500
+geo_study_data$originalData$GSE110487_GPL10999 <- NULL
+geo_study_data$originalData$GSE110487 <- geo_study_data$originalData$GSE110487_GPL16791
+geo_study_data$originalData$GSE110487_GPL16791 <- NULL
+```
+
+```{r}
+string <- geo_study_data$originalData$GSE242252$formattedName
+
+# Splitting the string by spaces
+split_string <- strsplit(string, " ")[[1]]
+
+# Selecting the first item
+first_item <- split_string[1]
+first_item
+```
+
+
+
+Merge all metadata together into one single dataframe
+```{r}
+count = 0
+for (study in geo_study_data$originalData) {
+  # extract study id without any platform specific artifacts
+  string <- study$formattedName
+
+  # Splitting the string by spaces
+  split_string <- strsplit(string, " ")[[1]]
+  
+  # Selecting the first item
+  study_id <- split_string[1]
+
+  study_metadata <- study$pheno
+  study_metadata$geo_study_id <- study_id
+  study_metadata$bioproject_id <- as.character(geo_to_bioproject_map[study_id])
+
+  if (count == 0) {
+    metadata <- study_metadata
+  } else {
+    metadata %<>% full_join(study_metadata)
+  }
+  
+  count = count + 1
+}
+
+metadata
+```
+
+## Load Expression Data 
+
+```{r}
+# Directory containing CSV files
+directory <- "./tpms/"
+
+# List all CSV files in the directory
+csv_files <- list.files(path = directory, pattern = "\\.csv$", full.names = TRUE)
+
+# Function to read and clean each data frame
+read_and_clean_csv <- function(file) {
+  df <- read.csv(file)
+  
+  # Check if the "X" column exists and remove it if present
+  if ("X" %in% colnames(df)) {
+    df <- df %>% select(-X)
+  }
+  
+  # remove version names after each symbol
+  df$Name <- str_split_fixed(df$Name, "\\.", 2)[, 1]
+  
+  df %<>% left_join(hgnc_symbols, by = c("Name"="ensembl_transcript_id")) %>% filter(!is.na(hgnc_symbol)) %>% filter(hgnc_symbol != "") %>% select(-Name) %>% group_by(hgnc_symbol) %>% summarise_if(is.numeric, sum) %>% ungroup() %>% select(hgnc_symbol, everything())
+  
+
+  return(df)
+}
+
+# Read and clean each CSV file into a list of data frames
+data_frames <- lapply(csv_files, read_and_clean_csv)
+
+# Perform a left join on all data frames by the "Name" column
+combined_data <- Reduce(function(x, y) left_join(x, y, by = "hgnc_symbol"), data_frames)
+
+# Display the resulting data frame
+combined_data
+```
+
+
+
+Remove duplicate columns (select only one of them)
+```{r}
+# Function to modify column names
+modify_column_names <- function(df) {
+  df %>%
+    # Remove columns that end with '_x'
+    select(-ends_with("_x")) %>%
+    # Rename columns that end with '_y'
+    rename_with(~ sub("_y$", "", .), ends_with("_y"))
+}
+
+# Apply the function to the dataframe
+modified_df <- modify_column_names(combined_data)
+
+# Print the modified dataframe
+modified_df
+```
+
+Remove rows from the metadata where we dont have a sample
+```{r}
+metadata %<>% filter(geo_accession %in% names(modified_df))
+metadata
+```
+
+Remove samples which we don't have metadata for
+```{r}
+columns_to_keep <- c("hgnc_symbol", metadata$geo_accession)
+
+modified_df %<>% select(all_of(columns_to_keep))
+modified_df
+```
+
+
+
+Find a gene with the most amount of non-zero values
+```{r}
+# Function to find the row with the maximum number of nonzero values
+find_max_nonzero_row <- function(df) {
+  # Exclude the 'hgnc_symbol' column from numeric calculations
+  numeric_data <- df[, -which(names(df) == "hgnc_symbol")]
+  
+  # Count nonzero values in each row
+  nonzero_counts <- apply(numeric_data, 1, function(x) sum(x != 0))
+  
+  # Find the index of the row with the maximum count of nonzero values
+  max_nonzero_index <- which.max(nonzero_counts)
+  
+  # Return the row with the most nonzero values
+  df[max_nonzero_index, ]
+}
+
+# Find the row with the most nonzero values
+max_nonzero_row <- find_max_nonzero_row(modified_df)
+
+# Print the result
+max_nonzero_row
+```
+
+```{r}
+# Function to find the row with the maximum number of nonzero values
+find_max_nonzero_row <- function(df) {
+  # Exclude the 'hgnc_symbol' column from numeric calculations
+  numeric_data <- df[, -which(names(df) == "hgnc_symbol")]
+  
+  # Count nonzero values in each row
+  nonzero_counts <- apply(numeric_data, 1, function(x) sum(x != 0))
+  
+  # Find the index of the row with the maximum count of nonzero values
+  max_nonzero_index <- which.max(nonzero_counts)
+  
+  # Return the index of the row with the most nonzero values
+  return(max_nonzero_index)
+}
+
+# Identify the row with the most nonzero values
+max_nonzero_index <- find_max_nonzero_row(modified_df)
+
+# Divide other rows by the values in the identified row
+divide_by_max_nonzero_row <- function(df, max_index) {
+  # Get the values of the row with the most nonzero values
+  divisor_row <- df[max_index, -which(names(df) == "hgnc_symbol")]
+  
+  # Create a copy of the data frame to store results
+  result_df <- df
+  
+  # Perform division for each row
+  for (i in seq_len(nrow(df))) {
+    if (i != max_index) {
+      result_df[i, -which(names(df) == "hgnc_symbol")] <- df[i, -which(names(df) == "hgnc_symbol")] / divisor_row
+    }
+  }
+  
+  return(result_df)
+}
+
+# Perform the division
+result_data <- divide_by_max_nonzero_row(modified_df, max_nonzero_index)
+
+# Print the result
+result_data
+```
+
+```{r}
+# view the basis of the ratio
+modified_df[max_nonzero_index, ]
+```
+Manually Label Metadata
+```{r}
+control_sample_subset <- c("GSM7656959", "GSM7656960", "GSM7656961", "GSM7656962", "GSM7471422", "GSM7471435", "GSM7471438", "GSM7471439", "GSM7471440", "GSM5653794", "GSM5653795", "GSM5653796", "GSM5653797", "GSM5653798", "GSM5653799", "GSM5653800", "GSM5653801", "GSM5653802", "GSM5653803", "GSM4913615", "GSM4913616", "GSM4913618", "GSM4913630", "GSM4913631", "GSM4913632", "GSM4913634", "GSM4913635", "GSM4913637", "GSM4913638", "GSM4913639", "GSM4913642", "GSM4913644", "GSM4913645", "GSM4913646", "GSM4913648", "GSM4913650", "GSM4913651", "GSM4913655", "GSM4704719", "GSM4704720", "GSM4704721", "GSM4704722", "GSM4704723", "GSM4704724", "GSM4426266", "GSM4426268", "GSM4426269", "GSM4426271", "GSM4426278", "GSM4426280", "GSM4426281", "GSM4426282", "GSM4426283", "GSM4426284", "GSM3512219", "GSM3512220", "GSM3512221")
+
+psoriasis_samples <- c("GSM4426285", "GSM4426279", "GSM4426277", "GSM4426276", "GSM4426275", "GSM4426274", "GSM4426273", "GSM4426272", "GSM4426270", "GSM4426267")
+
+bacteria_exposure <- metadata %>% filter(`characteristics_ch1.1` %in% c("treatment: Heat killed Escherichia coli", "treatment: Heat killed Staphylococcus aureus")) %>% pull(geo_accession)
+
+sle <- metadata %>% filter(`characteristics_ch1` %in% c("treatment: Placebo")) %>% filter(geo_study_id == "GSE139940") %>% pull(geo_accession)
+
+sle_treated_with_tofacitinib <- metadata %>% filter(`characteristics_ch1` %in% c("treatment: Tofacitinib")) %>% filter(geo_study_id == "GSE139940") %>%
+  filter(!grepl("Day 1", title)) %>% pull(geo_accession)
+
+pregnant_malaria <- metadata %>% filter(geo_study_id == "GSE234585") %>% filter(grepl("Positive_pregnant", title)) %>% pull(geo_accession)
+
+malaria <- metadata %>% filter(geo_study_id == "GSE234585") %>% filter(grepl("Positive_nonpregnant", title)) %>% pull(geo_accession)
+
+pregnant <- metadata %>% filter(geo_study_id == "GSE234585") %>% filter(grepl("Negative_pregnant", title)) %>% pull(geo_accession)
+
+trigeminal_neuralgia <- metadata %>% filter(geo_study_id == "GSE186505") %>% filter(!grepl("Control", title)) %>% pull(geo_accession)
+
+
+additional_healthy_samples <- metadata %>% filter(geo_study_id == "GSE224849") %>%  separate(title, into = c("prefix", "split_sample_id"), sep = "_", remove = FALSE) %>%
+  select(-prefix) %>% group_by(split_sample_id)  %>% filter(n() == 1) %>% pull(geo_accession)
+
+control_sample_subset <- c(control_sample_subset, additional_healthy_samples)
+
+systemic_sclerosis <- metadata %>% filter(geo_study_id == "GSE224849") %>%  separate(title, into = c("prefix", "split_sample_id"), sep = "_", remove = FALSE) %>%
+  select(-prefix) %>% group_by(split_sample_id)  %>% filter(n() > 1) %>% pull(geo_accession)
+
+
+bacterial_pneumonia <- metadata %>% filter(geo_study_id == "GSE161731") %>% filter(`cohort:ch1` == "Bacterial") %>% pull(geo_accession)
+  
+influenza <- metadata %>% filter(geo_study_id == "GSE161731")  %>% filter(`cohort:ch1` == "Influenza") %>% pull(geo_accession)
+  
+covid_19 <- metadata %>% filter(geo_study_id == "GSE161731") %>% filter(`cohort:ch1` == "COVID-19") %>% pull(geo_accession)
+
+seasonal_coronavirus <- metadata %>% filter(geo_study_id == "GSE161731") %>% filter(`cohort:ch1` == "CoV other") %>% pull(geo_accession)
+
+more_covid <- metadata %>% filter(geo_study_id == "GSE155454") %>% filter(grepl("day", title)) %>% pull(geo_accession)
+
+covid_19 <- c(covid_19, more_covid)
+
+more_healthy <- metadata %>% filter(geo_study_id == "GSE155454") %>% filter(!grepl("day", title)) %>% pull(geo_accession)
+
+control_sample_subset <- c(control_sample_subset, more_healthy)
+
+zika_virus <- c("GSM3512222", "GSM3512223", "GSM3512224")
+
+septic_shock <- metadata %>% filter(geo_study_id == "GSE110487") %>% pull(geo_accession)
+
+labeled_samples <- c(control_sample_subset, psoriasis_samples, bacteria_exposure, sle, sle_treated_with_tofacitinib, pregnant, pregnant_malaria, malaria, pregnant, trigeminal_neuralgia, systemic_sclerosis, bacterial_pneumonia, influenza, covid_19, seasonal_coronavirus, zika_virus, septic_shock)
+```
+
+```{r}
+metadata %>% filter(!geo_accession %in% labeled_samples)
+```
+
+```{r}
+# add metadata
+selected_metadata <- metadata %>% select(geo_accession, geo_study_id, instrument_model) %>%
+  group_by(geo_accession) %>%
+  slice(1) %>%
+  ungroup() %>% mutate(disease_state = case_when(
+    geo_accession %in% control_sample_subset ~ "Healthy Control",
+    geo_accession %in% psoriasis_samples ~ "Psoriasis",
+    geo_accession %in% bacteria_exposure ~ "Inoculated w/ Heat Killed Bacteria",
+    geo_accession %in% sle ~ "SLE",
+    geo_accession %in% sle_treated_with_tofacitinib ~ "SLE on Tofacitinib",
+    geo_accession %in% pregnant_malaria ~ "Pregnant + Malaria",
+    geo_accession %in% malaria ~ "Malaria",
+    geo_accession %in% pregnant ~ "Pregnant",
+    geo_accession %in% trigeminal_neuralgia ~ "Trigeminal Neuralgia",
+    geo_accession %in% systemic_sclerosis ~ "Systemic Sclerosis",
+    geo_accession %in% bacterial_pneumonia ~ "Bacterial Pneumonia",
+    geo_accession %in% influenza ~ "Influenza",
+    geo_accession %in% covid_19 ~ "COVID-19",
+    geo_accession %in% seasonal_coronavirus ~ "Seasonal Coronavirus",
+    geo_accession %in% zika_virus ~ "Zika Virus",
+    geo_accession %in% septic_shock ~ "Septic Shock",
+    TRUE ~ "Unlabeled"
+  ))
+```
+
+## PCA
+
+### Untransformed
+```{r}
+working_df <- modified_df
+
+working_df %<>% column_to_rownames(var="hgnc_symbol")
+
+#working_df %<>% select(all_of(control_sample_subset)) # if we only want to look at the healthy samples
+
+#Transpose
+working_df <- as.data.frame(t(working_df))
+
+# remove genes with zero variance
+df_filtered <- working_df[, sapply(working_df, function(x) length(unique(x)) > 1)]
+
+# Remove genes where any value is not finite (i.e., infinity or NaN)
+df_filtered <- df_filtered[, sapply(df_filtered, function(x) all(is.finite(x)))]
+
+# Perform PCA
+pca_result <- prcomp(df_filtered, center = TRUE, scale. = TRUE)
+
+# Extract PCA scores
+pca_scores <- as.data.frame(pca_result$x)
+
+
+pca_scores %<>% rownames_to_column(var="geo_accession") %>% left_join(selected_metadata, by=c("geo_accession"="geo_accession")) %>% filter(disease_state != "Unlabeled")
+
+# Create a PCA plot that shows PCA by study
+ggplot(pca_scores, aes(x = PC1, y = PC2, color=geo_study_id)) +
+  geom_point(size = 1, alpha = 0.3) +
+  xlab(paste("PC1: ", round(summary(pca_result)$importance[2,1] * 100, 2), "% variance", sep = "")) +
+  ylab(paste("PC2: ", round(summary(pca_result)$importance[2,2] * 100, 2), "% variance", sep = "")) +
+  ggtitle("PCA of Whole Blood RNAseq Data") +
+  theme_minimal() +
+  theme(legend.position = "none") + ggtitle("")
+
+# instrument
+ggplot(pca_scores, aes(x = PC1, y = PC2, color=instrument_model)) +
+  geom_point(size = 1, alpha = 0.3) +
+  xlab(paste("PC1: ", round(summary(pca_result)$importance[2,1] * 100, 2), "% variance", sep = "")) +
+  ylab(paste("PC2: ", round(summary(pca_result)$importance[2,2] * 100, 2), "% variance", sep = "")) +
+  ggtitle("PCA of Whole Blood RNAseq Data") +
+  theme_minimal() +
+  theme(legend.position = "none") + ggtitle("")
+
+# disease state
+ggplot(pca_scores, aes(x = PC1, y = PC2, color=disease_state)) +
+  geom_point(size = 1, alpha = 0.3) +
+  xlab(paste("PC1: ", round(summary(pca_result)$importance[2,1] * 100, 2), "% variance", sep = "")) +
+  ylab(paste("PC2: ", round(summary(pca_result)$importance[2,2] * 100, 2), "% variance", sep = "")) +
+  ggtitle("PCA of Whole Blood RNAseq Data") +
+  theme_minimal() +
+  theme(legend.position = "none") + ggtitle("")
+
+```
+
+
+### Ratio Normalized
+
+```{r}
+
+working_df <- result_data %>% filter(hgnc_symbol != "AACS")
+
+working_df %<>% column_to_rownames(var="hgnc_symbol")
+
+#working_df %<>% select(all_of(control_sample_subset)) # if we only want to look at the healthy samples
+
+#Transpose
+working_df <- as.data.frame(t(working_df))
+
+# remove genes with zero variance
+df_filtered <- working_df[, sapply(working_df, function(x) length(unique(x)) > 1)]
+
+# Remove genes where any value is not finite (i.e., infinity or NaN)
+df_filtered <- df_filtered[, sapply(df_filtered, function(x) all(is.finite(x)))]
+
+# Perform PCA
+pca_result <- prcomp(df_filtered, center = TRUE, scale. = TRUE)
+
+# Extract PCA scores
+pca_scores <- as.data.frame(pca_result$x)
+
+
+pca_scores %<>% rownames_to_column(var="geo_accession") %>% left_join(selected_metadata, by=c("geo_accession"="geo_accession")) %>% filter(disease_state != "Unlabeled")
+
+# Create a PCA plot that shows PCA by study
+ggplot(pca_scores, aes(x = PC1, y = PC2, color=geo_study_id)) +
+  geom_point(size = 1, alpha = 0.3) +
+  xlab(paste("PC1: ", round(summary(pca_result)$importance[2,1] * 100, 2), "% variance", sep = "")) +
+  ylab(paste("PC2: ", round(summary(pca_result)$importance[2,2] * 100, 2), "% variance", sep = "")) +
+  ggtitle("PCA of Whole Blood RNAseq Data") +
+  theme_minimal() +
+  theme(legend.position = "none") + ggtitle("")
+
+# instrument
+ggplot(pca_scores, aes(x = PC1, y = PC2, color=instrument_model)) +
+  geom_point(size = 1, alpha = 0.3) +
+  xlab(paste("PC1: ", round(summary(pca_result)$importance[2,1] * 100, 2), "% variance", sep = "")) +
+  ylab(paste("PC2: ", round(summary(pca_result)$importance[2,2] * 100, 2), "% variance", sep = "")) +
+  ggtitle("PCA of Whole Blood RNAseq Data") +
+  theme_minimal() +
+  theme(legend.position = "none") + ggtitle("")
+
+# disease state
+ggplot(pca_scores, aes(x = PC1, y = PC2, color=disease_state)) +
+  geom_point(size = 1, alpha = 0.3) +
+  xlab(paste("PC1: ", round(summary(pca_result)$importance[2,1] * 100, 2), "% variance", sep = "")) +
+  ylab(paste("PC2: ", round(summary(pca_result)$importance[2,2] * 100, 2), "% variance", sep = "")) +
+  ggtitle("PCA of Whole Blood RNAseq Data") +
+  theme_minimal() +
+  theme(legend.position = "none") + ggtitle("")
+
+```
+
+### Percentile Normalization
+If we normalize to percentile, does this reduce the variance?
+
+```{r}
+# Function to replace values with percentiles
+replace_with_percentiles <- function(column) {
+  # Ensure column is numeric
+  column <- as.numeric(column)
+  
+  # Add a small jitter to avoid duplicate quantiles
+  column <- jitter(column, factor = 1e-10)
+  
+  # Define percentile boundaries
+  percentiles <- quantile(column, probs = seq(0, 1, by = 0.1), na.rm = TRUE, type = 7)
+  
+  # Create a new column with percentile values
+  replaced_column <- cut(column, breaks = percentiles, include.lowest = TRUE, labels = seq(0, 0.9, by = 0.1))
+  
+  # Convert factor to numeric
+  as.numeric(as.character(replaced_column))
+}
+
+working_df_2 <- modified_df
+working_df_2 %<>% column_to_rownames(var="hgnc_symbol")
+
+working_df_2 <- as.data.frame(t(working_df_2))
+
+# remove genes with zero variance
+working_df_2 <- working_df_2[, sapply(working_df_2, function(x) length(unique(x)) > 1)]
+
+# Remove genes where any value is not finite (i.e., infinity or NaN)
+working_df_2 <- working_df_2[, sapply(working_df_2, function(x) all(is.finite(x)))]
+
+working_df_2 <- as.data.frame(t(working_df_2))
+
+
+# Apply the function to each column
+df_percentiles <- as.data.frame(apply(working_df_2, 2, replace_with_percentiles))
+rownames(df_percentiles) <- rownames(working_df_2)
+
+# View the transformed data frame
+df_percentiles
+```
+
+
+
+
+Now lets try PCA with this one.....
+
+```{r}
+df_to_plot <- as.data.frame(t(df_percentiles))
+
+# Perform PCA
+pca_result <- prcomp(df_to_plot, center = TRUE, scale. = TRUE)
+
+# Extract PCA scores
+pca_scores <- as.data.frame(pca_result$x)
+
+
+pca_scores %<>% rownames_to_column(var="geo_accession") %>% left_join(selected_metadata, by=c("geo_accession"="geo_accession")) %>% filter(disease_state != "Unlabeled")
+
+
+
+# instrument
+ggplot(pca_scores, aes(x = PC1, y = PC2, color=geo_study_id)) +
+  geom_point(size = 2, alpha = 0.3) +
+  xlab(paste("PC1: ", round(summary(pca_result)$importance[2,1] * 100, 2), "% variance", sep = "")) +
+  ylab(paste("PC2: ", round(summary(pca_result)$importance[2,2] * 100, 2), "% variance", sep = "")) +
+  ggtitle("PCA of Whole Blood RNAseq Data") +
+  theme_minimal() +
+  theme(legend.position = "none") + ggtitle("")
+
+# disease state
+ggplot(pca_scores, aes(x = PC1, y = PC2, color=instrument_model)) +
+  geom_point(size = 2, alpha = 0.3) +
+  xlab(paste("PC1: ", round(summary(pca_result)$importance[2,1] * 100, 2), "% variance", sep = "")) +
+  ylab(paste("PC2: ", round(summary(pca_result)$importance[2,2] * 100, 2), "% variance", sep = "")) +
+  ggtitle("PCA of Whole Blood RNAseq Data") +
+  theme_minimal() +
+  scale_shape_manual(values = c(triangle = 17, circle = 16), guide = FALSE) +
+  guides(shape = FALSE) +
+  theme(legend.position = "none") + ggtitle("") # Remove the shape legend
+
+# disease state
+ggplot(pca_scores, aes(x = PC1, y = PC2, color=disease_state)) +
+  geom_point(size = 2, alpha = 0.3) +
+  xlab(paste("PC1: ", round(summary(pca_result)$importance[2,1] * 100, 2), "% variance", sep = "")) +
+  ylab(paste("PC2: ", round(summary(pca_result)$importance[2,2] * 100, 2), "% variance", sep = "")) +
+  ggtitle("PCA of Whole Blood RNAseq Data") +
+  theme_minimal() +
+  theme(legend.position = "none") + ggtitle("") 
+
+
+```
+This seems to be a bit better, but still not that good....
+
+### Healthy Controls Only
+(n = 80)
+Are there still batch effects?
+
+```{r}
+length(control_sample_subset)
+```
+
+
+```{r}
+df_to_plot <- as.data.frame(t(df_percentiles))
+
+df_to_plot %<>% rownames_to_column(var="geo_accession") %>% filter(geo_accession %in% control_sample_subset) %>% column_to_rownames(var="geo_accession")
+
+
+# Perform PCA
+pca_result <- prcomp(df_to_plot, center = TRUE, scale. = TRUE)
+
+# Extract PCA scores
+pca_scores <- as.data.frame(pca_result$x)
+
+
+pca_scores %<>% rownames_to_column(var="geo_accession") %>% left_join(selected_metadata, by=c("geo_accession"="geo_accession")) %>% filter(disease_state != "Unlabeled")
+
+# Create a PCA plot that shows PCA by study
+ggplot(pca_scores, aes(x = PC1, y = PC2, color=geo_study_id)) +
+  geom_point(size = 3, alpha = 0.3) +
+  xlab(paste("PC1: ", round(summary(pca_result)$importance[2,1] * 100, 2), "% variance", sep = "")) +
+  ylab(paste("PC2: ", round(summary(pca_result)$importance[2,2] * 100, 2), "% variance", sep = "")) +
+  ggtitle("PCA of Healthy Whole Blood RNAseq Data (GEO Study ID)") +
+  theme_minimal() + theme(legend.position = "none") + ggtitle("") 
+
+# instrument
+ggplot(pca_scores, aes(x = PC1, y = PC2, color=instrument_model)) +
+  geom_point(size = 3, alpha = 0.3) +
+  xlab(paste("PC1: ", round(summary(pca_result)$importance[2,1] * 100, 2), "% variance", sep = "")) +
+  ylab(paste("PC2: ", round(summary(pca_result)$importance[2,2] * 100, 2), "% variance", sep = "")) +
+  ggtitle("PCA of Healthy Whole Blood RNAseq Data (Sequencing Platform)") +
+  theme_minimal() + theme(legend.position = "none") + ggtitle("") 
+
+```
+
+The smaller clusters by study, and then the larger clusters by instrument (despite the fact these are all whole blood samples) - shows that study has the largest effect on variance, followed by instrument
+
+
