@@ -10,7 +10,7 @@ To download and process expression data for this analysis, I used my `ena_rnaseq
 
 All data processing and analysis can be found in `analysis.Rmd`. 
 
-## Findings
+## Summary
 ### Data
 I looked at a total of 575 samples from 10 studies in GEO (GSE110487, GSE123835, GSE139940, GSE147339, GSE155454, GSE161731, GSE186505, GSE224849, GSE234585, GSE237960). I only looked at studies which had measured whole blood bulk RNAseq data from one of the following platforms (Illumina HiSeq 2500, IlluminaHiSeq 3000, Illumina HiSeq 4000, and Illumina NovaSeq 6000). To try and minimize potential sources of variance, I quantified all samples from their FASTQ files using Salmon. 
 
