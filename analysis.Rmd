@@ -17,7 +17,6 @@ library(biomaRt)
 library(ggplot2)
 library(stats)
 ```
-
 Get conversion table
 ```{r}
 # Connect to the Ensembl BioMart database
@@ -175,7 +174,15 @@ modified_df %<>% select(all_of(columns_to_keep))
 modified_df
 ```
 
+### Visually Inspect
+```{r}
+metadata
+```
 
+
+```{r}
+modified_df
+```
 
 Find a gene with the most amount of non-zero values
 ```{r}
@@ -334,68 +341,10 @@ selected_metadata <- metadata %>% select(geo_accession, geo_study_id, instrument
 ```
 
 ## PCA
-
-### Untransformed
-```{r}
-working_df <- modified_df
-
-working_df %<>% column_to_rownames(var="hgnc_symbol")
-
-#working_df %<>% select(all_of(control_sample_subset)) # if we only want to look at the healthy samples
-
-#Transpose
-working_df <- as.data.frame(t(working_df))
-
-# remove genes with zero variance
-df_filtered <- working_df[, sapply(working_df, function(x) length(unique(x)) > 1)]
-
-# Remove genes where any value is not finite (i.e., infinity or NaN)
-df_filtered <- df_filtered[, sapply(df_filtered, function(x) all(is.finite(x)))]
-
-# Perform PCA
-pca_result <- prcomp(df_filtered, center = TRUE, scale. = TRUE)
-
-# Extract PCA scores
-pca_scores <- as.data.frame(pca_result$x)
-
-
-pca_scores %<>% rownames_to_column(var="geo_accession") %>% left_join(selected_metadata, by=c("geo_accession"="geo_accession")) %>% filter(disease_state != "Unlabeled")
-
-# Create a PCA plot that shows PCA by study
-ggplot(pca_scores, aes(x = PC1, y = PC2, color=geo_study_id)) +
-  geom_point(size = 1, alpha = 0.3) +
-  xlab(paste("PC1: ", round(summary(pca_result)$importance[2,1] * 100, 2), "% variance", sep = "")) +
-  ylab(paste("PC2: ", round(summary(pca_result)$importance[2,2] * 100, 2), "% variance", sep = "")) +
-  ggtitle("PCA of Whole Blood RNAseq Data") +
-  theme_minimal() +
-  theme(legend.position = "none") + ggtitle("")
-
-# instrument
-ggplot(pca_scores, aes(x = PC1, y = PC2, color=instrument_model)) +
-  geom_point(size = 1, alpha = 0.3) +
-  xlab(paste("PC1: ", round(summary(pca_result)$importance[2,1] * 100, 2), "% variance", sep = "")) +
-  ylab(paste("PC2: ", round(summary(pca_result)$importance[2,2] * 100, 2), "% variance", sep = "")) +
-  ggtitle("PCA of Whole Blood RNAseq Data") +
-  theme_minimal() +
-  theme(legend.position = "none") + ggtitle("")
-
-# disease state
-ggplot(pca_scores, aes(x = PC1, y = PC2, color=disease_state)) +
-  geom_point(size = 1, alpha = 0.3) +
-  xlab(paste("PC1: ", round(summary(pca_result)$importance[2,1] * 100, 2), "% variance", sep = "")) +
-  ylab(paste("PC2: ", round(summary(pca_result)$importance[2,2] * 100, 2), "% variance", sep = "")) +
-  ggtitle("PCA of Whole Blood RNAseq Data") +
-  theme_minimal() +
-  theme(legend.position = "none") + ggtitle("")
-
-```
-
-
-### Ratio Normalized
-
 ```{r}
 
 working_df <- result_data %>% filter(hgnc_symbol != "AACS")
+#working_df <- modified_df
 
 working_df %<>% column_to_rownames(var="hgnc_symbol")
 
@@ -448,8 +397,9 @@ ggplot(pca_scores, aes(x = PC1, y = PC2, color=disease_state)) +
 
 ```
 
-### Percentile Normalization
+# Percentile Normalization
 If we normalize to percentile, does this reduce the variance?
+
 
 ```{r}
 # Function to replace values with percentiles
@@ -544,8 +494,7 @@ ggplot(pca_scores, aes(x = PC1, y = PC2, color=disease_state)) +
 ```
 This seems to be a bit better, but still not that good....
 
-### Healthy Controls Only
-(n = 80)
+# Looking at Just Healthy Controls (n = 80)
 Are there still batch effects?
 
 ```{r}
@@ -588,4 +537,70 @@ ggplot(pca_scores, aes(x = PC1, y = PC2, color=instrument_model)) +
 
 The smaller clusters by study, and then the larger clusters by instrument (despite the fact these are all whole blood samples) - shows that study has the largest effect on variance, followed by instrument
 
+## Rank Normalizaation
+This should maybe help with differences in dynamic range?
+
+Rank genes based on expression from highest to lowest to try and normalize 
+```{r}
+working_df_3 <- modified_df
+working_df_3 %<>% column_to_rownames(var="hgnc_symbol")
+working_df_3_ranked <- apply(working_df_3, 2, function(x) rank(x, ties.method = "min"))
+as.data.frame(working_df_3_ranked)
+
+# Min-max normalization function
+min_max_normalize <- function(x) {
+  return ((x - min(x)) / (max(x) - min(x)))
+}
+
+# Apply the function to each column of the dataframe
+working_df_3_normalized <- as.data.frame(apply(working_df_3_ranked, 2, min_max_normalize))
+```
+
+```{r}
+df_to_plot <- as.data.frame(t(working_df_3_normalized))
+
+#df_to_plot %<>% rownames_to_column(var="geo_accession") %>% filter(geo_accession %in% control_sample_subset) %>% column_to_rownames(var="geo_accession")
+
+df_to_plot %<>% rownames_to_column(var="geo_accession") %>% column_to_rownames(var="geo_accession")
+
+
+# remove genes with zero variance
+df_to_plot <- df_to_plot[, sapply(df_to_plot, function(x) length(unique(x)) > 1)]
+
+# Remove genes where any value is not finite (i.e., infinity or NaN)
+df_to_plot <- df_to_plot[, sapply(df_to_plot, function(x) all(is.finite(x)))]
+
+# Perform PCA
+pca_result <- prcomp(df_to_plot, center = TRUE, scale. = TRUE)
+
+# Extract PCA scores
+pca_scores <- as.data.frame(pca_result$x)
+
+
+pca_scores %<>% rownames_to_column(var="geo_accession") %>% left_join(selected_metadata, by=c("geo_accession"="geo_accession")) %>% filter(disease_state != "Unlabeled")
+
+# Create a PCA plot that shows PCA by study
+ggplot(pca_scores, aes(x = PC1, y = PC2, color=geo_study_id)) +
+  geom_point(size = 1, alpha = 0.3) +
+  xlab(paste("PC1: ", round(summary(pca_result)$importance[2,1] * 100, 2), "% variance", sep = "")) +
+  ylab(paste("PC2: ", round(summary(pca_result)$importance[2,2] * 100, 2), "% variance", sep = "")) +
+  ggtitle("PCA of Healthy Whole Blood RNAseq Data (GEO Study ID)") +
+  theme_minimal() 
+
+# instrument
+ggplot(pca_scores, aes(x = PC1, y = PC2, color=instrument_model)) +
+  geom_point(size = 1, alpha = 0.3) +
+  xlab(paste("PC1: ", round(summary(pca_result)$importance[2,1] * 100, 2), "% variance", sep = "")) +
+  ylab(paste("PC2: ", round(summary(pca_result)$importance[2,2] * 100, 2), "% variance", sep = "")) +
+  ggtitle("PCA of Healthy Whole Blood RNAseq Data (Sequencing Platform)") +
+  theme_minimal()  
+
+ggplot(pca_scores, aes(x = PC1, y = PC2, color=disease_state)) +
+  geom_point(size = 1, alpha = 0.3) +
+  xlab(paste("PC1: ", round(summary(pca_result)$importance[2,1] * 100, 2), "% variance", sep = "")) +
+  ylab(paste("PC2: ", round(summary(pca_result)$importance[2,2] * 100, 2), "% variance", sep = "")) +
+  ggtitle("PCA of Whole Blood RNAseq Data") +
+  theme_minimal()  
+
+```
 
